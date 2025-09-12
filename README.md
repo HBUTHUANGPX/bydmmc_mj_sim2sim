@@ -1,5 +1,5 @@
 # bydmmc_mj_sim2sim
-`pip install mujoco==3.2.7` This code has only been tested using mujoco version 3.2.7 in pyhton 3.10.18
+`pip install mujoco==3.2.7` This code has only been tested using mujoco version 3.2.7 in pyhton 3.10.18。You need install `Pinocchio` lib by `conda install pinocchio -c conda-forge`.You can check CHANGELOG.md for update details.
 ## Citation Statement
 1. The robot model H1-2 originated from [`Unitree`](https://www.unitree.com/) was used
 
