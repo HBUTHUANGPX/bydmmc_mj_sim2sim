@@ -17,15 +17,20 @@ import matplotlib.pyplot as plt
 import queue
 import threading
 import pickle
-
+import pinocchio as pin
+from pinocchio.utils import zero
+from pinocchio.robot_wrapper import RobotWrapper
+"""
+ conda install pinocchio -c conda-forge
+"""
 from math_func import *
 from motion_loader import MotionLoader
-from video_recorder import VideoRecorder
+from video_recoder import VideoRecorder
 
 np.set_printoptions(precision=16, linewidth=100, threshold=np.inf, suppress=True)
 
 current_path = os.getcwd()
-
+print("current_path: ",current_path)
 
 class cfg:
     simulator_dt = 0.002
@@ -34,13 +39,15 @@ class cfg:
     policy_type = "onnx"  # torch or onnx
     policy_path = (
         current_path
-        + "/deploy_mujoco/deploy_policy/2025-08-29_14-15-44_h1_2_LF2_w1s1_v0_30000step.onnx"
+        + "/deploy_policy/2025-09-11_15-46-51_h1_2_hpx_walk_v3_4500step.onnx"
     )
-    mjcf_path = current_path + "/deploy_mujoco/assets/unitree_h1_2/h1_2.xml"
+    asset_path = "/asset/unitree_h1_2"
+    mjcf_path = current_path + asset_path + "/h1_2.xml"
+    urdf_path = current_path + asset_path + "/h1_2.urdf"
     motion_file = (
-        current_path + "/deploy_mujoco/deploy_policy/artifacts/w1s1_h1_2:v0/motion.npz"
+        current_path + "/deploy_policy/artifacts/hpx_walk_h1_2:v3/motion.npz"
     )
-    sim_data_filename = current_path + "/deploy_mujoco/deploy_policy/data.pkl"
+    sim_data_filename = current_path + "/deploy_policy/data.pkl"
     only_leg_flag = False  # True, False
     with_wrist_flag = True  # True, False
 
@@ -96,7 +103,7 @@ class cfg:
     # obs param #
     #############
     frame_stack = 1
-    num_single_obs = 150
+    num_single_obs = 144
 
     ####################
     # motion play mode #
@@ -207,6 +214,63 @@ class cfg:
         "right_wrist_yaw_link",
     ]
 
+class pin_mj:
+    def __init__(self, _URDF_PATH=""):
+        # ========== 1. 准备Pinocchio模型 ==========
+        URDF_PATH = _URDF_PATH
+        self.robot: RobotWrapper = RobotWrapper.BuildFromURDF(
+            URDF_PATH, current_path + cfg.asset_path, pin.JointModelFreeFlyer()
+        )
+
+        self.base_pos_world = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.base_quat_world = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    def mujoco_to_pinocchio(
+        self,
+        joint_angles,
+        base_pos=np.array([0.0, 0.0, 0.0], dtype=np.double),
+        base_quat=np.array([0.0, 0.0, 0.0, 1.0], dtype=np.double),
+    ):
+        """
+        将从Mujoco获取的机器人状态(基座位置、姿态、关节角)赋值到Pinocchio中。
+        base_pos: np.array([x, y, z]) 基座在世界坐标系的位置
+        base_quat: np.array([x, y, z, w]) 基座在世界坐标系的四元数 (Pinocchio默认的四元数顺序同为 [x,y,z,w])
+        joint_angles: np.array([...]) 机器人关节角，长度为model.nq - 7(若有浮动基), 或 model.nq(若固定基)
+        model, data: Pinocchio的model和data
+        """
+
+        q: np.ndarray = zero(
+            self.robot.model.nq
+        )  # 广义坐标 [7 + nJoints] (若 free-flyer)
+
+        # 如果是浮动基模式，则前7维为 [x, y, z, q_x, q_y, q_z, q_w]
+        # 注意：Pinocchio中free-flyer的顺序约定是 [xyz, qwxyz]
+        # 若是固定基，则model.nq == 机器人关节数，无需设置基座
+        if self.robot.model.joints[1].shortname() == "JointModelFreeFlyer":
+            q[0:3] = base_pos
+            q[3:7] = base_quat  # [x, y, z, w]
+            # 后面是机器人关节
+            q[7:] = joint_angles
+        else:
+            # 如果是固定基模型，则整段q都是关节
+            q[:] = joint_angles
+
+        # pin.forwardKinematics(self.model, self.data, q.astype(np.double).reshape(self.model.nq))
+        self.robot.framesForwardKinematics(q)
+        """ros的python环境在bash中会被引入，产生冲突
+        unset PYTHONPATH
+        unset LD_LIBRARY_PATH
+        """
+        # forwardGeometry(或 updateFramePlacements) 通常可以帮助更新 frame 的位姿
+        # pin.updateFramePlacements(self.robot.model, self.robot.data)
+
+        return q
+
+    def get_link_quaternion(self, link_name=""):
+        self._link_id = self.robot.model.getFrameId(link_name)
+        _rot_world: np.ndarray = self.robot.data.oMf[self._link_id].rotation
+        return R.from_matrix(_rot_world).as_quat(scalar_first=True)
+
 
 class simulator:
     policy: ort.InferenceSession
@@ -216,6 +280,7 @@ class simulator:
         self.spec = mujoco.MjSpec.from_file(cfg.mjcf_path)
         self._rehandle_xml()
         self.m = self.spec.compile()
+        self.pin = pin_mj(cfg.urdf_path)
         # self.m = mujoco.MjModel.from_xml_path(cfg.mjcf_path)
         self.d = mujoco.MjData(self.m)
         self._scene = mujoco.MjvScene(self.m, 100000)
@@ -230,7 +295,7 @@ class simulator:
         self.data_queue = queue.Queue()
         self.change_id = 0
         self.video_recorder = VideoRecorder(
-            path=current_path + "/deploy_mujoco/recordings",
+            path=current_path + "/recordings",
             tag=None,
             video_name="video_0",
             fps=int(1 / cfg.policy_dt),
@@ -417,18 +482,16 @@ class simulator:
     def update_obs(self, time_step):
         """
         +----------------------------------------------------------+
-        | Active Observation Terms in Group: 'policy' (shape: (150,)) |
+        | Active Observation Terms in Group: 'policy' (shape: (144,)) |
         +------------+--------------------------------+------------+
         |   Index    | Name                           |   Shape    |
         +------------+--------------------------------+------------+
         |     0      | command                        |   (54,)    |
-        |     1      | motion_ref_pos_b               |    (3,)    |
-        |     2      | motion_ref_ori_b               |    (6,)    |
-        |     3      | base_lin_vel                   |    (3,)    |
-        |     4      | base_ang_vel                   |    (3,)    |
-        |     5      | joint_pos                      |   (27,)    |
-        |     6      | joint_vel                      |   (27,)    |
-        |     7      | actions                        |   (27,)    |
+        |     1      | motion_ref_ori_b               |    (6,)    |
+        |     2      | base_ang_vel                   |    (3,)    |
+        |     3      | joint_pos                      |   (27,)    |
+        |     4      | joint_vel                      |   (27,)    |
+        |     5      | actions                        |   (27,)    |
         +------------+--------------------------------+------------+
         """
         #################
@@ -440,70 +503,49 @@ class simulator:
         #################
         self.single_obs[27:54] = self.motion.joint_vel[time_step]
 
-        body_name = "torso_link"  # robot_ref_body_index=3 motion_ref_body_index=7
-        # body_name = "pelvis"
-        body_id = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, body_name)
-        if body_id == -1:
-            raise ValueError(f"Body {body_name} not found in model")
-        position = self.d.xpos[body_id]
-        quaternion = self.d.xquat[body_id]
-        self.robot_ref_pos_w = torch.from_numpy(position).unsqueeze(0)  # shape [n,3]
-        self.robot_ref_quat_w = torch.from_numpy(quaternion).unsqueeze(0)  # shape [n,4]
-        self.ref_pos_w = self.motion.body_pos_w[time_step, 7, :]  # shape [n,3]
-        # self.ref_pos_w[:, 0] += 1.25
-        self.ref_quat_w = self.motion.body_quat_w[time_step, 7, :]  # shape [n,4]
-        pos, ori = subtract_frame_transforms(
-            self.robot_ref_pos_w, self.robot_ref_quat_w, self.ref_pos_w, self.ref_quat_w
-        )  # shape [n,3][n,4]
-        mat = matrix_from_quat(ori)
-        motion_ref_pos_b = pos.view(1, -1)  # shape [n,3]
-        motion_ref_ori_b = mat[..., :2].reshape(mat.shape[0], -1)  # shape [n,6]
-        #################
-        # motion_ref_pos_b 3
-        #################
-        self.single_obs[54:57] = motion_ref_pos_b
         #################
         # motion_ref_ori_b 6
         #################
-        self.single_obs[57:63] = motion_ref_ori_b
-        #################
-        # base_lin_vel 3
-        #################
-        self.single_obs[63:66] = (
-            quat_rotate_inverse(
-                torch.from_numpy(self.d.qpos[3:7]).unsqueeze(0),
-                torch.from_numpy(self.d.qvel[0:3]).unsqueeze(0),
-            )
-            .detach()
-            .cpu()
-            .numpy()
+        body_name = "torso_link"  # robot_ref_body_index=3 motion_ref_body_index=7
+
+        self.pin.mujoco_to_pinocchio(
+            self.d.qpos[7:],
+            base_pos=self.d.qpos[0:3],
+            base_quat=self.d.qpos[3:7][[1, 2, 3, 0]],
         )
+        _quat = self.pin.get_link_quaternion(body_name)
+        self.robot_ref_quat_w = torch.from_numpy(_quat).unsqueeze(0)  # shape [n,4]
+        self.ref_quat_w = self.motion.body_quat_w[time_step, 7, :]  # shape [n,4]
+
+        q01 = self.robot_ref_quat_w
+        q02 = self.ref_quat_w
+        q10 = quat_inv(q01)
+        if q02 is not None:
+            q12 = quat_mul(q10, q02)
+        else:
+            q12 = q10
+        mat = matrix_from_quat(q12)
+        motion_ref_ori_b = mat[..., :2].reshape(mat.shape[0], -1)  # shape [n,6]
+
+        self.single_obs[54:60] = motion_ref_ori_b
         #################
         # base_ang_vel 3
         #################
-        self.single_obs[66:69] = (
-            quat_rotate_inverse(
-                torch.from_numpy(self.d.qpos[3:7]).unsqueeze(0),
-                torch.from_numpy(self.d.qvel[3:6]).unsqueeze(0),
-            )
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        self.single_obs[60:63] = self.d.qvel[3:6]
         #################
         # joint_pos 27
         #################
-        self.single_obs[69:96] = (
+        self.single_obs[63:90] = (
             self.d.qpos[7:] - self.default_pos[: self.action_num]
         )[self.mujoco2isaac_sim_index]
         #################
         # joint_vel 27
         #################
-        self.single_obs[96:123] = self.d.qvel[6:][self.mujoco2isaac_sim_index]
+        self.single_obs[90:117] = self.d.qvel[6:][self.mujoco2isaac_sim_index]
         #################
         # actions 27
         #################
-        self.single_obs[123:150] = self.action  # / self.action_scale
+        self.single_obs[117:144] = self.action  # / self.action_scale
 
         self.obs = (
             torch.tensor(np.concatenate([self.single_obs] * cfg.frame_stack, axis=-1))
@@ -735,7 +777,7 @@ class simulator:
         ) = session.run(
             None,
             {
-                obs_name: obs.reshape(1, 150),
+                obs_name: obs.reshape(1, cfg.num_single_obs),
                 time_step_name: time_step.reshape(1, 1),
             },
         )
